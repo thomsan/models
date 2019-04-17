@@ -17,6 +17,8 @@ import collections
 import os
 import re
 import time
+import glob
+import re
 
 import numpy as np
 import tensorflow as tf
@@ -223,6 +225,89 @@ def visualize_detection_results(result_dict,
                   tag)
 
 
+def _run_specific_checkpoint_once(tensor_dict,
+                         evaluators=None,
+                         batch_processor=None,
+                         checkpoint_file=None,
+                         variables_to_restore=None,
+                         restore_fn=None,
+                         num_batches=1,
+                         master='',
+                         save_graph=False,
+                         save_graph_dir=''):
+  """ utility function to run evaluation on a specific checkpoint
+  Keyword arguments similar to _run_checkpoint_once, The difference being,
+ - Takes a argument called checkpoint_file instead of checkpoint_path
+ - restore_function takes an additional param called as checkpoint_file
+  """
+  if save_graph and not save_graph_dir:
+      raise ValueError('`save_graph_dir` must be defined.')
+  sess = tf.Session(master, graph=tf.get_default_graph())
+  sess.run(tf.global_variables_initializer())
+  sess.run(tf.local_variables_initializer())
+  sess.run(tf.tables_initializer())
+  if not restore_fn:
+      raise ValueError("restore function must be implemented")
+  restore_fn(sess,checkpoint_file)
+
+  if save_graph:
+    tf.train.write_graph(sess.graph_def, save_graph_dir, 'eval.pbtxt')
+
+  counters = {'skipped': 0, 'success': 0}
+  with tf.contrib.slim.queues.QueueRunners(sess):
+    try:
+      for batch in range(int(num_batches)):
+        if (batch + 1) % 100 == 0:
+          tf.logging.info('Running eval ops batch %d/%d', batch + 1, num_batches)
+        if not batch_processor:
+          try:
+            result_dict = sess.run(tensor_dict)
+            counters['success'] += 1
+          except tf.errors.InvalidArgumentError:
+            tf.logging.info('Skipping image')
+            counters['skipped'] += 1
+            result_dict = {}
+        else:
+          result_dict = batch_processor(tensor_dict, sess, batch, counters)
+
+        if len(result_dict) > 2:
+          tf.logging.warning("len(result_dict) = {} but we're only using the first one".format(len(result_dict)))
+          tf.logging.info(result_dict[0][fields.InputDataFields.key])
+
+        for evaluator in evaluators:
+          # TODO(b/65130867): Use image_id tensor once we fix the input data
+          # decoders to return correct image_id.
+          # TODO(akuznetsa): result_dict contains batches of images, while
+          # add_single_ground_truth_image_info expects a single image. Fix
+          if (isinstance(result_dict, dict) and
+              fields.InputDataFields.key in result_dict and
+              result_dict[fields.InputDataFields.key]):
+            image_id = result_dict[fields.InputDataFields.key]
+          else:
+            image_id = batch
+
+          evaluator.add_single_ground_truth_image_info(
+              image_id=image_id, groundtruth_dict=result_dict[0])
+          evaluator.add_single_detected_image_info(
+              image_id=image_id, detections_dict=result_dict[0])
+      tf.logging.info('Running eval batches done.')
+    except tf.errors.OutOfRangeError:
+      tf.logging.info('Done evaluating -- epoch limit reached')
+    finally:
+      # When done, ask the threads to stop.
+      tf.logging.info('# success: %d', counters['success'])
+      tf.logging.info('# skipped: %d', counters['skipped'])
+      all_evaluator_metrics = {}
+      for evaluator in evaluators:
+        metrics = evaluator.evaluate()
+        evaluator.clear()
+        if any(key in all_evaluator_metrics for key in metrics):
+          raise ValueError('Metric names between evaluators must not collide.')
+        all_evaluator_metrics.update(metrics)
+      global_step = tf.train.global_step(sess, tf.train.get_global_step())
+  sess.close()
+  return (global_step, all_evaluator_metrics)
+
 def _run_checkpoint_once(tensor_dict,
                          evaluators=None,
                          batch_processor=None,
@@ -398,6 +483,7 @@ def repeated_checkpoint_run(tensor_dict,
                             evaluators,
                             batch_processor=None,
                             checkpoint_dirs=None,
+                            evaluate_all_checkpoints=False,
                             variables_to_restore=None,
                             restore_fn=None,
                             num_batches=1,
@@ -435,6 +521,7 @@ def repeated_checkpoint_run(tensor_dict,
     checkpoint_dirs: list of directories to load into a DetectionModel or an
       EnsembleModel if restore_fn isn't set. Also used to determine when to run
       next evaluation. Must have at least one element.
+    evaluate_all_checkpoints: bool whether to evaluate all the checkpoints in the checkpoint dir Default False
     variables_to_restore: None, or a dictionary mapping variable names found in
       a checkpoint to model variables. The dictionary would normally be
       generated by creating a tf.train.ExponentialMovingAverage object and
@@ -468,62 +555,98 @@ def repeated_checkpoint_run(tensor_dict,
     ValueError: if max_num_of_evaluations is not None or a positive number.
     ValueError: if checkpoint_dirs doesn't have at least one element.
   """
-  if max_number_of_evaluations and max_number_of_evaluations <= 0:
-    raise ValueError(
-        '`max_number_of_evaluations` must be either None or a positive number.')
-  if max_evaluation_global_step and max_evaluation_global_step <= 0:
-    raise ValueError(
-        '`max_evaluation_global_step` must be either None or positive.')
+  if not evaluate_all_checkpoints:
+    if max_number_of_evaluations and max_number_of_evaluations <= 0:
+      raise ValueError(
+          '`max_number_of_evaluations` must be either None or a positive number.')
+    if max_evaluation_global_step and max_evaluation_global_step <= 0:
+      raise ValueError(
+          '`max_evaluation_global_step` must be either None or positive.')
 
-  if not checkpoint_dirs:
-    raise ValueError('`checkpoint_dirs` must have at least one entry.')
+    if not checkpoint_dirs:
+      raise ValueError('`checkpoint_dirs` must have at least one entry.')
 
-  last_evaluated_model_path = None
-  number_of_evaluations = 0
-  while True:
-    start = time.time()
-    tf.logging.info('Starting evaluation at ' + time.strftime(
-        '%Y-%m-%d-%H:%M:%S', time.gmtime()))
-    model_path = tf.train.latest_checkpoint(checkpoint_dirs[0])
-    if not model_path:
-      tf.logging.info('No model found in %s. Will try again in %d seconds',
-                      checkpoint_dirs[0], eval_interval_secs)
-    elif model_path == last_evaluated_model_path:
-      tf.logging.info('Found already evaluated checkpoint. Will try again in '
-                      '%d seconds', eval_interval_secs)
-    else:
-      last_evaluated_model_path = model_path
-      global_step, metrics = _run_checkpoint_once(
-          tensor_dict,
-          evaluators,
-          batch_processor,
-          checkpoint_dirs,
-          variables_to_restore,
-          restore_fn,
-          num_batches,
-          master,
-          save_graph,
-          save_graph_dir,
-          losses_dict=losses_dict,
-          eval_export_path=eval_export_path,
-          process_metrics_fn=process_metrics_fn)
-      write_metrics(metrics, global_step, summary_dir)
-      if (max_evaluation_global_step and
-          global_step >= max_evaluation_global_step):
+    last_evaluated_model_path = None
+    number_of_evaluations = 0
+    while True:
+      start = time.time()
+      tf.logging.info('Starting evaluation at ' + time.strftime(
+          '%Y-%m-%d-%H:%M:%S', time.gmtime()))
+      model_path = tf.train.latest_checkpoint(checkpoint_dirs[0])
+      if not model_path:
+        tf.logging.info('No model found in %s. Will try again in %d seconds',
+                        checkpoint_dirs[0], eval_interval_secs)
+      elif model_path == last_evaluated_model_path:
+        tf.logging.info('Found already evaluated checkpoint. Will try again in '
+                        '%d seconds', eval_interval_secs)
+      else:
+        last_evaluated_model_path = model_path
+        global_step, metrics = _run_checkpoint_once(
+            tensor_dict,
+            evaluators,
+            batch_processor,
+            checkpoint_dirs,
+            variables_to_restore,
+            restore_fn,
+            num_batches,
+            master,
+            save_graph,
+            save_graph_dir,
+            losses_dict=losses_dict,
+            eval_export_path=eval_export_path,
+            process_metrics_fn=process_metrics_fn)
+        write_metrics(metrics, global_step, summary_dir)
+        if (max_evaluation_global_step and
+            global_step >= max_evaluation_global_step):
+          tf.logging.info('Finished evaluation!')
+          break
+      number_of_evaluations += 1
+
+      if (max_number_of_evaluations and
+          number_of_evaluations >= max_number_of_evaluations):
         tf.logging.info('Finished evaluation!')
         break
-    number_of_evaluations += 1
+      time_to_next_eval = start + eval_interval_secs - time.time()
+      if time_to_next_eval > 0:
+        time.sleep(time_to_next_eval)
 
-    if (max_number_of_evaluations and
-        number_of_evaluations >= max_number_of_evaluations):
-      tf.logging.info('Finished evaluation!')
-      break
-    time_to_next_eval = start + eval_interval_secs - time.time()
-    if time_to_next_eval > 0:
-      time.sleep(time_to_next_eval)
+    return metrics
 
-  return metrics
+  else:
+    # evaluates all the checkpoints
+    # tf.train.get_checkpoint_state returns only top 5 check points
+    # Thus a custom naive method is used to get the list of all checkpoints
+    model_paths = glob.glob(os.path.join(checkpoint_dirs[0],'*.meta'))
+    tf.logging.info('Evaluating all the {} models present in the checkpoint dir'.format(len(model_paths)))
+    if not model_paths:
+      raise RuntimeError("no checkpoint found, this method searhces for checkpoints using glob and .meta extension")
 
+    # The checkpoints need to be sorted using natural sorting so that values don't mess up when visualized in tensorboard
+    # below 2 function accompolishes natural sorting
+    def atoi(text):
+        return int(text) if text.isdigit() else text
+
+    def natural_keys(text):
+        '''
+        alist.sort(key=natural_keys) sorts in human order
+        http://nedbatchelder.com/blog/200712/human_sorting.html
+        '''
+        return [ atoi(c) for c in re.split('(\d+)', text) ]
+
+    model_paths.sort(key=natural_keys)
+    tf.logging.info("Evaluating {} checkpoints".format(len(model_paths)))
+    model_paths = [os.path.splitext(f)[0] for f in model_paths] # naive method to get checkpoint full path
+    for model_path in model_paths:
+      global_step, metrics = _run_specific_checkpoint_once(tensor_dict, evaluators,
+                                                    batch_processor,
+                                                    model_path,
+                                                    variables_to_restore,
+                                                    restore_fn, num_batches,
+                                                    master, save_graph,
+                                                    save_graph_dir)
+      write_metrics(metrics, global_step, summary_dir)
+
+    return metrics
 
 def _scale_box_to_absolute(args):
   boxes, image_shape = args

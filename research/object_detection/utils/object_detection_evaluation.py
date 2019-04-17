@@ -210,7 +210,7 @@ class ObjectDetectionEvaluator(DetectionEvaluator):
       if idx + self._label_id_offset in category_index:
         category_name = category_index[idx + self._label_id_offset]['name']
         try:
-          category_name = unicode(category_name, 'utf-8')
+          category_name = str(category_name, 'utf-8')
         except TypeError:
           pass
         category_name = unicodedata.normalize('NFKD', category_name).encode(
@@ -224,6 +224,7 @@ class ObjectDetectionEvaluator(DetectionEvaluator):
               .format(self._matching_iou_threshold, category_name))
 
   def add_single_ground_truth_image_info(self, image_id, groundtruth_dict):
+    print('Adding image {}.'.format(image_id))
     """Adds groundtruth for a single image to be used for evaluation.
 
     Args:
@@ -348,7 +349,7 @@ class ObjectDetectionEvaluator(DetectionEvaluator):
       if idx + self._label_id_offset in category_index:
         category_name = category_index[idx + self._label_id_offset]['name']
         try:
-          category_name = unicode(category_name, 'utf-8')
+          category_name = str(category_name, 'utf-8')
         except TypeError:
           pass
         category_name = unicodedata.normalize(
