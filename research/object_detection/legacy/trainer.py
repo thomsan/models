@@ -374,7 +374,8 @@ def train(create_tensor_dict_fn,
     # Save checkpoints regularly.
     keep_checkpoint_every_n_hours = train_config.keep_checkpoint_every_n_hours
     saver = tf.train.Saver(
-        keep_checkpoint_every_n_hours=keep_checkpoint_every_n_hours)
+        keep_checkpoint_every_n_hours=keep_checkpoint_every_n_hours,
+        max_to_keep=None) # keep all checkpoints
 
     # Create ops required to initialize the model from a given checkpoint.
     init_fn = None
@@ -395,7 +396,7 @@ def train(create_tensor_dict_fn,
                            get_variables_available_in_checkpoint(
                                var_map, train_config.fine_tune_checkpoint,
                                include_global_step=False))
-      init_saver = tf.train.Saver(available_var_map)
+      init_saver = tf.train.Saver(available_var_map, max_to_keep=None)
       def initializer_fn(sess):
         init_saver.restore(sess, train_config.fine_tune_checkpoint)
       init_fn = initializer_fn

@@ -95,6 +95,7 @@ def main(unused_argv):
       master=tpu_grpc_url,
       evaluation_master=tpu_grpc_url,
       model_dir=FLAGS.model_dir,
+      keep_checkpoint_max=None,
       tpu_config=tf.contrib.tpu.TPUConfig(
           iterations_per_loop=FLAGS.iterations_per_loop,
           num_shards=FLAGS.num_shards))
